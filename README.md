@@ -84,6 +84,23 @@ combine a persistent jail, the standard secret masks, and read-only binds of the
 host install so the jailed agent uses your real config without being able to
 rewrite it.
 
+## WSL host setup
+
+`wsl/` holds the surrounding WSL2 configuration — the OOM mitigations, the
+memwatch toolset, and the systemd user units. These are separate from the
+sandbox but share its blast radius: agents run under `bwrap` inside
+`/init.scope`, so an agent's memory spike is what takes the VM down.
+
+```
+wsl/
+├── bin/                          memwatch-{sample,report,boot-check,ack,uninstall}
+├── systemd/memwatch.service      the sampler, capped + OOM-deprioritised
+├── systemd/herdr.service         herdr server outside /init.scope
+├── etc/wsl.conf                  systemd=true, default user
+├── etc/wslconfig-windows.ini     -> C:\Users\<you>\.wslconfig  (memory=10GB)
+└── etc/init.scope.d-oompolicy.conf   the high-leverage OOM fix (needs sudo)
+```
+
 ## Design notes
 
 The non-obvious decisions are written up in [`docs/`](docs/):
@@ -91,6 +108,8 @@ The non-obvious decisions are written up in [`docs/`](docs/):
 * [Git access](docs/git-access.md) — why `.git` is read-write and what is pinned
 * [WSL quirks](docs/wsl.md) — DNS, microphone/PulseAudio
 * [GUI AppImages](docs/gui-appimages.md) — Electron under WSLg
+* [WSL OOM crashes](docs/wsl-oom.md) — why the VM dies, and the fixes in leverage order
+* [memwatch](docs/memwatch.md) — the crash-tracing toolset
 
 ## Requirements
 

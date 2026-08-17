@@ -1,0 +1,19 @@
+[Unit]
+Description=memwatch — record memory pressure so OOM crashes leave a trace
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Check for a previous OOM crash before starting to sample.
+ExecStartPre=-%h/bin/memwatch-boot-check
+ExecStart=%h/bin/memwatch-sample
+Restart=always
+RestartSec=5
+Nice=10
+# Never let the recorder itself become part of the problem, but leave enough
+# headroom that the journalctl in ExecStartPre (page cache) can't trip the cap.
+MemoryMax=256M
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=default.target

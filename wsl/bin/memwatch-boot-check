@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# memwatch-boot-check — run once per boot. If the PREVIOUS boot died of OOM,
+# generate the crash report and raise an unread flag so the next shell you open
+# tells you about it. This is the "you don't have to remember" part.
+
+set -uo pipefail
+
+DIR="${XDG_STATE_HOME:-$HOME/.local/state}/memwatch"
+mkdir -p "$DIR"
+
+boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+stamp="$DIR/.checked-$boot_id"
+
+# Already checked this boot — nothing to do.
+[ -e "$stamp" ] && exit 0
+
+# Clean up stamps from older boots.
+find "$DIR" -maxdepth 1 -name '.checked-*' -delete 2>/dev/null
+: >"$stamp"
+
+# Did the previous boot end in an OOM kill?
+if journalctl -b -1 --no-pager 2>/dev/null | grep -q "Out of memory: Killed process"; then
+	"$HOME/bin/memwatch-report" >/dev/null 2>&1
+	: >"$DIR/UNREAD"
+fi

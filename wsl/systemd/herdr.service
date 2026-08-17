@@ -1,0 +1,41 @@
+[Unit]
+# Run the herdr server OUTSIDE /init.scope so it survives the OOM teardown.
+#
+# By default the herdr server is auto-spawned by the first client, which makes it a
+# grandchild of a WezTerm tab's bash — so it inherits /init.scope. When an OOM kill lands in
+# that scope, systemd tears the whole thing down and SIGKILLs the server along with the tabs.
+#
+# Started as a user service it lives under user.slice/user@1000.service instead, which the
+# init.scope teardown does not touch.
+#
+# REQUIRES LINGERING. Without it, logind stops user@1000.service ~10s after the last session
+# dies and takes this service with it:
+#   sudo loginctl enable-linger aboitier
+#
+# Install (NOTE: this stops the currently-running server and ends your current herdr
+# session — do it at a natural break point):
+#   herdr server stop
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now herdr.service
+#
+# Verify it is out of init.scope (should print the user@1000 path, NOT /init.scope):
+#   cat /proc/$(pgrep -f 'herdr server')/cgroup
+#
+# Revert:
+#   systemctl --user disable --now herdr.service
+Description=herdr server — persistent terminal workspace manager
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/herdr server
+ExecStop=%h/.local/bin/herdr server stop
+Restart=always
+RestartSec=2
+
+# Deliberately no MemoryMax: capping the session server is the opposite of what we want.
+# Bias the OOM killer away from it so a memory spike costs an agent, not the workspace.
+OOMScoreAdjust=-250
+
+[Install]
+WantedBy=default.target

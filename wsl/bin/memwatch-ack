@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# memwatch-ack — dismiss the crash banner (the report itself is kept).
+DIR="${XDG_STATE_HOME:-$HOME/.local/state}/memwatch"
+rm -f "$DIR/UNREAD"
+echo "Dismissed. Report kept at $DIR/LAST-CRASH-REPORT.txt"

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# memwatch-report — reconstruct what happened before the last OOM crash.
+#
+# Run with no args: inspects the PREVIOUS boot. If it ended in an OOM kill,
+# writes a report to ~/.local/state/memwatch/LAST-CRASH-REPORT.txt and prints it.
+#
+#   memwatch-report          # analyse previous boot (the usual case)
+#   memwatch-report -b -3    # analyse an older boot
+#   memwatch-report --now    # live view of current pressure, no crash needed
+
+set -uo pipefail
+
+DIR="${XDG_STATE_HOME:-$HOME/.local/state}/memwatch"
+REPORT="$DIR/LAST-CRASH-REPORT.txt"
+BOOT="-1"
+LOOKBACK="${MEMWATCH_LOOKBACK:-1800}" # seconds of history to show before the crash
+
+mkdir -p "$DIR"
+
+case "${1:-}" in
+-b)
+	BOOT="${2:?need a boot offset}"
+	;;
+--now)
+	echo "=== live pressure ==="
+	free -h
+	echo
+	ps -eo rss,pid,comm --sort=-rss | head -16 |
+		awk 'NR==1{print "  RSS_MB    PID  COMMAND"} NR>1{printf "%8.0f %6s  %s\n", $1/1024, $2, $3}'
+	exit 0
+	;;
+esac
+
+# --- did that boot die of OOM? -----------------------------------------------
+oom_lines=$(journalctl -b "$BOOT" --no-pager 2>/dev/null |
+	grep -E "invoked oom-killer|Out of memory: Killed process|oom-kill:constraint|Free swap|Total swap")
+
+if [ -z "$oom_lines" ]; then
+	echo "No OOM found in boot $BOOT — that boot did not die of memory exhaustion."
+	exit 1
+fi
+
+crash_epoch=$(journalctl -b "$BOOT" -n 1 -o short-unix --no-pager 2>/dev/null |
+	awk '{print int($1)}')
+[ -n "${crash_epoch:-}" ] || crash_epoch=$(date +%s)
+since=$((crash_epoch - LOOKBACK))
+
+{
+	echo "================================================================"
+	echo " MEMWATCH CRASH REPORT — boot $BOOT"
+	echo " Crash at: $(date -d "@$crash_epoch" '+%Y-%m-%d %H:%M:%S %Z')"
+	echo " Showing the $((LOOKBACK / 60)) minutes leading up to it."
+	echo "================================================================"
+	echo
+	echo "--- KERNEL OOM EVIDENCE ------------------------------------------"
+	echo "$oom_lines"
+	echo
+
+	echo "--- PRESSURE RAMP (MemAvailable / SwapFree, MB) -------------------"
+	if [ -f "$DIR/samples.tsv" ] || [ -f "$DIR/samples.tsv.1" ]; then
+		cat "$DIR/samples.tsv.1" "$DIR/samples.tsv" 2>/dev/null |
+			awk -F'\t' -v s="$since" -v e="$crash_epoch" '
+				$1=="T" && $2>=s && $2<=e {
+					printf "%s   avail %7.0f MB   swapfree %7.0f MB\n",
+						strftime("%H:%M:%S", $2), $3/1024, $4/1024
+				}' | awk 'NR%6==1'   # thin to ~1 line/minute at 10s sampling
+	else
+		echo "(no samples — recorder was not running for that boot)"
+	fi
+	echo
+
+	echo "--- PEAK RSS PER PROCESS IN THAT WINDOW (MB) ---------------------"
+	cat "$DIR/samples.tsv.1" "$DIR/samples.tsv" 2>/dev/null |
+		awk -F'\t' -v s="$since" -v e="$crash_epoch" '
+			$1=="P" && $2>=s && $2<=e {
+				key = $5 " (pid " $3 ")"
+				if ($4+0 > peak[key]) peak[key] = $4+0
+			}
+			END {for (k in peak) printf "%9.0f  %s\n", peak[k]/1024, k}' |
+		sort -rn | head -20
+	echo
+
+	echo "--- GROWTH: processes that grew most across the window -----------"
+	cat "$DIR/samples.tsv.1" "$DIR/samples.tsv" 2>/dev/null |
+		awk -F'\t' -v s="$since" -v e="$crash_epoch" '
+			$1=="P" && $2>=s && $2<=e {
+				key = $5 " (pid " $3 ")"
+				if (!(key in first) || $2 < ft[key]) {first[key]=$4+0; ft[key]=$2}
+				if (!(key in last)  || $2 > lt[key]) {last[key]=$4+0;  lt[key]=$2}
+			}
+			END {
+				for (k in first) {
+					d = (last[k]-first[k])/1024
+					if (d > 50) printf "%+9.0f MB  %-40s (%.0f -> %.0f MB)\n", d, k, first[k]/1024, last[k]/1024
+				}
+			}' | sort -rn | head -15
+	echo
+	echo "=================================================================="
+} >"$REPORT"
+
+cat "$REPORT"
+echo
+echo "(saved to $REPORT)"

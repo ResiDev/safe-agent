@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# memwatch-sample — periodically record memory pressure + top consumers.
+#
+# Writes a rotating TSV to ~/.local/state/memwatch/samples.tsv so that when the
+# WSL VM dies from OOM we have the *ramp*, not just the corpse in dmesg.
+#
+# Format (tab separated):
+#   T  <epoch>  <memavail_kb>  <swapfree_kb>  <swaptotal_kb>
+#   P  <epoch>  <pid>  <rss_kb>  <comm>
+#
+# Remove with: memwatch-uninstall
+
+set -uo pipefail
+
+INTERVAL="${MEMWATCH_INTERVAL:-10}"
+TOPN="${MEMWATCH_TOPN:-20}"
+DIR="${XDG_STATE_HOME:-$HOME/.local/state}/memwatch"
+LOG="$DIR/samples.tsv"
+MAXBYTES="${MEMWATCH_MAXBYTES:-$((64 * 1024 * 1024))}"
+
+mkdir -p "$DIR"
+
+while :; do
+	ts=$(date +%s)
+
+	# Global pressure. MemAvailable is the honest number; SwapFree hitting 0
+	# is the signal that precedes death.
+	awk -v ts="$ts" '
+		/^MemAvailable:/ {a = $2}
+		/^SwapFree:/     {sf = $2}
+		/^SwapTotal:/    {st = $2}
+		END {printf "T\t%s\t%s\t%s\t%s\n", ts, a, sf, st}
+	' /proc/meminfo >>"$LOG"
+
+	# Top consumers by RSS.
+	ps -eo rss=,pid=,comm= --sort=-rss 2>/dev/null |
+		head -n "$TOPN" |
+		awk -v ts="$ts" '{rss=$1; pid=$2; $1=""; $2=""; sub(/^ +/,""); printf "P\t%s\t%s\t%s\t%s\n", ts, pid, rss, $0}' \
+			>>"$LOG"
+
+	# Rotate so we keep at most 2 generations.
+	sz=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+	if [ "$sz" -gt "$MAXBYTES" ]; then
+		mv -f "$LOG" "$DIR/samples.tsv.1"
+	fi
+
+	sleep "$INTERVAL"
+done

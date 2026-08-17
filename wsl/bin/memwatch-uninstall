@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# memwatch-uninstall — remove everything memwatch installed.
+set -uo pipefail
+
+systemctl --user disable --now memwatch.service 2>/dev/null
+rm -f "$HOME/.config/systemd/user/memwatch.service"
+systemctl --user daemon-reload 2>/dev/null
+
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+	[ -f "$rc" ] || continue
+	if grep -q '# >>> memwatch >>>' "$rc"; then
+		sed -i '/# >>> memwatch >>>/,/# <<< memwatch <<</d' "$rc"
+		echo "removed banner hook from $rc"
+	fi
+done
+
+rm -f "$HOME/bin/memwatch-sample" "$HOME/bin/memwatch-report" \
+	"$HOME/bin/memwatch-boot-check" "$HOME/bin/memwatch-ack"
+
+echo "memwatch removed. Recorded data left at ${XDG_STATE_HOME:-$HOME/.local/state}/memwatch"
+echo "Delete it with: rm -rf ${XDG_STATE_HOME:-$HOME/.local/state}/memwatch"
+echo "(this script did not delete itself: rm ~/bin/memwatch-uninstall)"
