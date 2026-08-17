@@ -22,9 +22,13 @@ usage: safe-agent [OPTIONS] [CMD [ARG...]]
   -j NAME    Named jail — persistent $HOME at ~/.cache/safe-agent/NAME/home
   -n         Block network
   -e VAR     Preserve environment variable VAR from outside (repeatable)
-  -b SRC:DST Bind SRC from host to DST inside sandbox, read-only (repeatable)
+  -b SRC:DST Bind SRC from host to DST inside sandbox, read-only (repeatable).
+             A missing SRC warns and is skipped — these are optional config binds.
+             Use -r when a missing path should be a hard error.
   -m PAT     Mask PAT inside the sandbox (file->empty file, dir->empty dir).
-             PAT may be a glob (e.g. '.env*', 'secrets/*') evaluated against CWD. Repeatable.
+             PAT may be a glob (e.g. '.env*', 'secrets/*') evaluated against CWD,
+             or an absolute path (e.g. "$HOME/.config/x"). Repeatable.
+  -N         Dry run — print the bwrap command line and exit, without running it
   -h         Show this help and exit
 
 With no CMD, a shell is started. Examples:
@@ -48,8 +52,9 @@ grant_cwd=1
 allow_net=1
 extra_envs=()
 masks=()
+dry_run=0
 
-while getopts "d:r:Dj:ne:b:m:h" opt; do
+while getopts "d:r:Dj:ne:b:m:Nh" opt; do
   case "$opt" in
     d) extra_rw+=("$OPTARG") ;;
     r) extra_ro+=("$OPTARG") ;;
@@ -59,6 +64,7 @@ while getopts "d:r:Dj:ne:b:m:h" opt; do
     e) extra_envs+=("$OPTARG") ;;
     b) extra_bind_ro+=("$OPTARG") ;;
     m) masks+=("$OPTARG") ;;
+    N) dry_run=1 ;;
     h|*) usage ;;
   esac
 done
@@ -96,6 +102,10 @@ args=(
   --ro-bind /usr /usr
   --ro-bind /etc /etc
   --ro-bind-try /opt /opt
+  # Read-only /sys. Without it Node sizes its heap from host-wide numbers
+  # instead of the cgroup limits under /sys/fs/cgroup, and anything counting
+  # CPUs via /sys/devices/system/cpu falls back to a guess — see docs/wsl-oom.md.
+  --ro-bind-try /sys /sys
   --ro-bind-try /mnt/wsl/resolv.conf /mnt/wsl/resolv.conf
   --ro-bind-try /mnt/wslg/PulseServer /mnt/wslg/PulseServer
   --symlink usr/bin /bin
@@ -174,9 +184,17 @@ done
 for d in "${extra_ro[@]}"; do
   args+=(--ro-bind "$d" "$d")
 done
+# -b binds are optional host config (an agent's settings, plugins, skills). Any
+# of them may be absent on a given machine, so warn and skip rather than aborting
+# the jail — a hard --ro-bind here took the whole sandbox down over one missing
+# settings file. Explicit access grants (-d/-r) still fail loudly on a typo.
 for spec in "${extra_bind_ro[@]}"; do
   src="${spec%%:*}"
   dst="${spec#*:}"
+  if [ ! -e "$src" ]; then
+    echo "safe-agent: warning: -b source '$src' does not exist; skipping" >&2
+    continue
+  fi
   args+=(--ro-bind "$src" "$dst")
 done
 
@@ -262,8 +280,13 @@ if [ -z "${PULSE_SERVER-}" ] && [ -S /mnt/wslg/PulseServer ]; then
   PULSE_SERVER="unix:/mnt/wslg/PulseServer"
 fi
 
-preserve=(HOME USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE
-          PATH COLORTERM COLUMNS LINES PULSE_SERVER)
+# TLS and proxy vars are preserved because omitting them fails obscurely: a
+# corporate CA bundle or an HTTP proxy is invisible in the error the agent shows.
+preserve=(HOME USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE TZ
+          PATH COLORTERM COLUMNS LINES PULSE_SERVER EDITOR VISUAL
+          SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS
+          HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+          http_proxy https_proxy all_proxy no_proxy)
 for var in "${preserve[@]}" "${extra_envs[@]}"; do
   if [ -n "${!var-}" ]; then
     args+=(--setenv "$var" "${!var}")
@@ -271,5 +294,14 @@ for var in "${preserve[@]}" "${extra_envs[@]}"; do
 done
 args+=(--setenv SAFE_AGENT 1)
 args+=(--setenv SAFE_AGENT_JAIL "${jail_name:-ephemeral}")
+
+if [ "$dry_run" = 1 ]; then
+  # Masks are the fiddly part (extglob, globstar, nesting). Printing the argv is
+  # the only way to see what a pattern actually resolved to before trusting it.
+  printf 'bwrap'
+  printf ' %q' "${args[@]}" "${cmd[@]}"
+  printf '\n'
+  exit 0
+fi
 
 exec bwrap "${args[@]}" "${cmd[@]}"

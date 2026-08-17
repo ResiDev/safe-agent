@@ -51,8 +51,8 @@ Nothing caps how many spawn.
 1. **`OOMPolicy=continue` on init.scope** — `wsl/etc/init.scope.d-oompolicy.conf`.
    Needs sudo. This is the fix that decouples "lost a process" from "lost the VM".
 2. **herdr as a user service** — `wsl/systemd/herdr.service`. Moves the server
-   into `user.slice/user@1000.service`, which the init.scope teardown doesn't
-   touch. **Requires lingering** (`sudo loginctl enable-linger aboitier`),
+   into `user.slice/user@$(id -u).service`, which the init.scope teardown doesn't
+   touch. **Requires lingering** (`sudo loginctl enable-linger "$USER"`),
    otherwise logind stops `user@1000.service` ~10s after the last session dies
    and takes herdr with it.
 3. **memwatch** — doesn't prevent anything, but means a crash leaves a trace.
