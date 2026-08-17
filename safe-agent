@@ -1,0 +1,275 @@
+#!/bin/bash
+# safe-agent — bubblewrap-based sandbox, roughly equivalent to jai's strict/bare mode.
+#
+# By default:
+#   * $HOME is an empty tmpfs (or a per-jail persistent dir with -j)
+#   * CWD is bind-mounted read-write (unless -D)
+#   * /usr, /etc, /opt are read-only
+#   * /tmp, /var/tmp, /run are private tmpfs
+#   * private PID/IPC/UTS namespaces
+#   * user namespace (UID unchanged from outside)
+#   * network ON (use -n to block)
+#   * most env vars stripped; a small safe set preserved
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: safe-agent [OPTIONS] [CMD [ARG...]]
+  -d DIR     Grant read-write access to DIR (repeatable)
+  -r DIR     Grant read-only access to DIR (repeatable)
+  -D         Do not grant access to the current working directory
+  -j NAME    Named jail — persistent $HOME at ~/.cache/safe-agent/NAME/home
+  -n         Block network
+  -e VAR     Preserve environment variable VAR from outside (repeatable)
+  -b SRC:DST Bind SRC from host to DST inside sandbox, read-only (repeatable)
+  -m PAT     Mask PAT inside the sandbox (file->empty file, dir->empty dir).
+             PAT may be a glob (e.g. '.env*', 'secrets/*') evaluated against CWD. Repeatable.
+  -h         Show this help and exit
+
+With no CMD, a shell is started. Examples:
+  safe-agent                        # ephemeral shell, CWD is writable
+  safe-agent -j claude claude       # persistent jail 'claude'
+  safe-agent -D -j claude claude    # same, but don't expose CWD
+  safe-agent -n codex               # no network
+  safe-agent -d /local/build ninja  # grant extra dir
+EOF
+  exit 0
+}
+
+STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/safe-agent"
+mkdir -p "$STATE_DIR"
+
+jail_name=""
+extra_rw=()
+extra_ro=()
+extra_bind_ro=()
+grant_cwd=1
+allow_net=1
+extra_envs=()
+masks=()
+
+while getopts "d:r:Dj:ne:b:m:h" opt; do
+  case "$opt" in
+    d) extra_rw+=("$OPTARG") ;;
+    r) extra_ro+=("$OPTARG") ;;
+    D) grant_cwd=0 ;;
+    j) jail_name="$OPTARG" ;;
+    n) allow_net=0 ;;
+    e) extra_envs+=("$OPTARG") ;;
+    b) extra_bind_ro+=("$OPTARG") ;;
+    m) masks+=("$OPTARG") ;;
+    h|*) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+cmd=("$@")
+if [ ${#cmd[@]} -eq 0 ]; then
+  cmd=("${SHELL:-/bin/bash}")
+fi
+
+cwd="$(pwd -P)"
+if [ "$grant_cwd" = 1 ] && [ "$cwd" = "$HOME" ]; then
+  echo "safe-agent: refusing to grant entire \$HOME. cd into a subdirectory, or use -D." >&2
+  exit 1
+fi
+
+if [ -n "$jail_name" ]; then
+  jail_home="$STATE_DIR/$jail_name/home"
+  mkdir -p "$jail_home"
+else
+  jail_home=""
+fi
+
+args=(
+  --die-with-parent
+  --as-pid-1
+  --unshare-pid
+  --unshare-ipc
+  --unshare-uts
+  --unshare-cgroup-try
+  --unshare-user
+  --uid "$(id -u)"
+  --gid "$(id -g)"
+  --hostname safe-agent
+  --ro-bind /usr /usr
+  --ro-bind /etc /etc
+  --ro-bind-try /opt /opt
+  --ro-bind-try /mnt/wsl/resolv.conf /mnt/wsl/resolv.conf
+  --ro-bind-try /mnt/wslg/PulseServer /mnt/wslg/PulseServer
+  --symlink usr/bin /bin
+  --symlink usr/sbin /sbin
+  --symlink usr/lib /lib
+  --symlink usr/lib64 /lib64
+  --tmpfs /tmp
+  --tmpfs /var/tmp
+  --tmpfs /run
+  --dev /dev
+  --proc /proc
+)
+
+if [ -n "$jail_home" ]; then
+  args+=(--bind "$jail_home" "$HOME")
+else
+  args+=(--tmpfs "$HOME")
+fi
+
+# Screenshots saved by pasteshot: expose read-only in every jail so image
+# paths can be pasted to agents inside. Must come after the $HOME mount.
+args+=(--ro-bind-try "$HOME/screenshots" "$HOME/screenshots")
+
+# Commits need an identity, and the jail has its own $HOME. Read-only, so the
+# agent can commit as you but cannot rewrite your global git settings.
+args+=(--ro-bind-try "$HOME/.gitconfig" "$HOME/.gitconfig")
+
+if [ "$grant_cwd" = 1 ]; then
+  args+=(--bind "$cwd" "$cwd" --chdir "$cwd")
+else
+  args+=(--chdir "$HOME")
+fi
+
+# Git metadata: read-write, so agents can commit, branch and rebase. Ref moves
+# are recoverable from the reflog, and push is gated by credentials (absent in
+# the jail), not by this mount. Worktrees keep their real metadata outside CWD,
+# so bind it explicitly; for a plain repo .git is already inside the CWD bind,
+# but re-binding it gives the nested read-only mounts below something to sit on.
+if [ "$grant_cwd" = 1 ] && command -v git >/dev/null 2>&1; then
+  if git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git_dir="$(git -C "$cwd" rev-parse --path-format=absolute --git-dir 2>/dev/null || true)"
+    git_common_dir="$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+
+    # Dedupe: outside a worktree both resolve to the same path, and binding it
+    # twice would shadow the config/hooks mounts made by the first pass.
+    git_meta_dirs=()
+    for d in "$git_dir" "$git_common_dir"; do
+      [ -n "$d" ] && [ -e "$d" ] || continue
+      [ "${git_meta_dirs[0]:-}" = "$d" ] && continue
+      git_meta_dirs+=("$d")
+    done
+
+    for git_meta_dir in "${git_meta_dirs[@]}"; do
+      args+=(--bind "$git_meta_dir" "$git_meta_dir")
+      # config and hooks grant new capability — a rewritten remote URL, or code
+      # that runs on every commit — rather than just moving refs. Keep them ro.
+      args+=(--ro-bind-try "$git_meta_dir/config" "$git_meta_dir/config")
+      args+=(--ro-bind-try "$git_meta_dir/hooks" "$git_meta_dir/hooks")
+
+      # Submodules keep their own config/hooks under .git/modules/<name>/, and
+      # can nest. Without these pins a submodule's remote URL stays writable and
+      # a hook dropped there runs on the host. Locate them by their config file.
+      if [ -d "$git_meta_dir/modules" ]; then
+        while IFS= read -r -d '' sub_git; do
+          args+=(--ro-bind-try "$sub_git/config" "$sub_git/config")
+          args+=(--ro-bind-try "$sub_git/hooks" "$sub_git/hooks")
+        done < <(find "$git_meta_dir/modules" -mindepth 2 -type f -name config -printf '%h\0' 2>/dev/null)
+      fi
+    done
+  fi
+fi
+
+for d in "${extra_rw[@]}"; do
+  args+=(--bind "$d" "$d")
+done
+for d in "${extra_ro[@]}"; do
+  args+=(--ro-bind "$d" "$d")
+done
+for spec in "${extra_bind_ro[@]}"; do
+  src="${spec%%:*}"
+  dst="${spec#*:}"
+  args+=(--ro-bind "$src" "$dst")
+done
+
+shopt -s nullglob extglob dotglob globstar
+mask_paths=()
+bare_patterns=()
+declare -A bare_hit=()
+name_filter=()
+for pattern in "${masks[@]}"; do
+  if [[ "$pattern" == */* ]]; then
+    # path-style pattern (e.g. 'secrets/*'): anchored at CWD, globstar-capable
+    found=($pattern)
+    if [ ${#found[@]} -eq 0 ]; then
+      echo "safe-agent: warning: mask pattern '$pattern' matched nothing in $cwd" >&2
+    fi
+    for path in "${found[@]}"; do mask_paths+=("$(readlink -m -- "$path")"); done
+  else
+    # bare name (e.g. '.env!(.test)'): mask at ANY depth — collected below.
+    bare_patterns+=("$pattern")
+    # Coarse find filter: literal prefix before any extglob group, + '*'. Always
+    # a SUPERSET of the precise pattern, so the 'case' below refines it without
+    # dropping matches — but find (in C) does the walk + name test, so the loop
+    # only iterates a few candidates instead of every file in the tree.
+    if [[ "$pattern" =~ ^(.*)[?*+@!]\( ]]; then
+      coarse="${BASH_REMATCH[1]}*"
+    else
+      coarse="$pattern"
+    fi
+    [ ${#name_filter[@]} -gt 0 ] && name_filter+=(-o)
+    name_filter+=(-name "$coarse")
+  fi
+done
+
+# Single tree walk for all bare-name patterns. find skips node_modules/.git,
+# descends hidden dirs (.worktrees), and does the coarse name match itself.
+if [ ${#bare_patterns[@]} -gt 0 ]; then
+  while IFS= read -r -d '' p; do
+    base="${p##*/}"
+    for pat in "${bare_patterns[@]}"; do
+      case "$base" in
+        $pat)                       # extglob honoured, so !(.test) works
+          mask_paths+=("$(readlink -m -- "$p")")
+          bare_hit[$pat]=1
+          break ;;
+      esac
+    done
+  done < <(find . \( -name node_modules -o -name .git \) -prune -o \( "${name_filter[@]}" \) -print0)
+  for pat in "${bare_patterns[@]}"; do
+    [ -n "${bare_hit[$pat]:-}" ] || \
+      echo "safe-agent: warning: mask pattern '$pat' matched nothing in $cwd" >&2
+  done
+fi
+shopt -u nullglob dotglob globstar
+
+# Apply masks. Skip any path nested under another masked directory — binding
+# inside a freshly-created tmpfs is pointless and can fail.
+for abs in "${mask_paths[@]}"; do
+  nested=0
+  for other in "${mask_paths[@]}"; do
+    [ "$abs" = "$other" ] && continue
+    [ -d "$other" ] || continue
+    case "$abs/" in "$other"/*) nested=1; break ;; esac
+  done
+  [ "$nested" = 1 ] && continue
+  if [ -d "$abs" ]; then
+    args+=(--tmpfs "$abs")
+  else
+    args+=(--ro-bind /dev/null "$abs")
+  fi
+done
+
+if [ "$allow_net" = 0 ]; then
+  args+=(--unshare-net)
+fi
+
+args+=(--clearenv)
+
+# WSLg audio: clients normally reach PulseAudio via /run/user/$UID/pulse/native,
+# a symlink into /mnt/wslg/runtime-dir that the sandbox's tmpfs /run wipes out.
+# The /mnt/wslg/PulseServer socket is bound in above, so point PULSE_SERVER at it
+# directly whenever the host env hasn't already set it.
+if [ -z "${PULSE_SERVER-}" ] && [ -S /mnt/wslg/PulseServer ]; then
+  PULSE_SERVER="unix:/mnt/wslg/PulseServer"
+fi
+
+preserve=(HOME USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE
+          PATH COLORTERM COLUMNS LINES PULSE_SERVER)
+for var in "${preserve[@]}" "${extra_envs[@]}"; do
+  if [ -n "${!var-}" ]; then
+    args+=(--setenv "$var" "${!var}")
+  fi
+done
+args+=(--setenv SAFE_AGENT 1)
+args+=(--setenv SAFE_AGENT_JAIL "${jail_name:-ephemeral}")
+
+exec bwrap "${args[@]}" "${cmd[@]}"
