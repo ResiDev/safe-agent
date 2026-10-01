@@ -23,11 +23,16 @@ usage: safe-agent [OPTIONS] [CMD [ARG...]]
   -n         Block network
   -e VAR     Preserve environment variable VAR from outside (repeatable)
   -b SRC:DST Bind SRC from host to DST inside sandbox, read-only (repeatable).
-             A missing SRC warns and is skipped — these are optional config binds.
-             Use -r when a missing path should be a hard error.
+             A missing SRC warns and is skipped — these are optional config binds
+             — and takes any mount point it left in a named jail's home with it.
+             Use -r when a missing path should be a hard error, as it should be
+             for anything the jail cannot run without.
   -m PAT     Mask PAT inside the sandbox (file->empty file, dir->empty dir).
              PAT may be a glob (e.g. '.env*', 'secrets/*') evaluated against CWD,
              or an absolute path (e.g. "$HOME/.config/x"). Repeatable.
+             Bare-name patterns are also watched for the life of the jail:
+             matching files created or renamed into CWD later are masked too.
+  -M         Mask at launch only; do not watch for new matching files
   -N         Dry run — print the bwrap command line and exit, without running it
   -h         Show this help and exit
 
@@ -52,9 +57,10 @@ grant_cwd=1
 allow_net=1
 extra_envs=()
 masks=()
+watch_masks=1
 dry_run=0
 
-while getopts "d:r:Dj:ne:b:m:Nh" opt; do
+while getopts "d:r:Dj:ne:b:m:MNh" opt; do
   case "$opt" in
     d) extra_rw+=("$OPTARG") ;;
     r) extra_ro+=("$OPTARG") ;;
@@ -64,6 +70,7 @@ while getopts "d:r:Dj:ne:b:m:Nh" opt; do
     e) extra_envs+=("$OPTARG") ;;
     b) extra_bind_ro+=("$OPTARG") ;;
     m) masks+=("$OPTARG") ;;
+    M) watch_masks=0 ;;
     N) dry_run=1 ;;
     h|*) usage ;;
   esac
@@ -127,7 +134,11 @@ fi
 
 # Screenshots saved by pasteshot: expose read-only in every jail so image
 # paths can be pasted to agents inside. Must come after the $HOME mount.
-args+=(--ro-bind-try "$HOME/screenshots" "$HOME/screenshots")
+if [ -d "$HOME/screenshots" ]; then
+  args+=(--ro-bind "$HOME/screenshots" "$HOME/screenshots")
+else
+  echo "safe-agent: warning: $HOME/screenshots does not exist; pasteshot images will not be available" >&2
+fi
 
 # Commits need an identity, and the jail has its own $HOME. Read-only, so the
 # agent can commit as you but cannot rewrite your global git settings.
@@ -184,15 +195,39 @@ done
 for d in "${extra_ro[@]}"; do
   args+=(--ro-bind "$d" "$d")
 done
+# bwrap has to create a mount point for every bind it makes. In a *named* jail
+# that mount point is a real file in the persistent home, and it outlives the
+# jail: an empty, read-only stub. While the bind is applied the stub is covered
+# and invisible. The moment the bind is skipped, the stub is all that is left —
+# and a stub on $PATH shadows the real binary with something unexecutable:
+#
+#   bwrap: execvp codex: Permission denied     (EACCES, not the ENOENT you expect)
+#
+# Same trap for config: a 0-byte settings.json parses differently from an absent
+# one. So a skipped bind takes its stale mount point with it. Only ever removes
+# an empty, non-symlink regular file at a path already declared a bind
+# destination, which cannot be jail state worth keeping.
+prune_stale_mount_point() {
+  local dst="$1" stub
+  [ -n "$jail_home" ] || return 0
+  case "$dst" in "$HOME"/*) ;; *) return 0 ;; esac
+  stub="$jail_home/${dst#"$HOME"/}"
+  [ -f "$stub" ] && [ ! -L "$stub" ] && [ ! -s "$stub" ] || return 0
+  rm -f "$stub" && echo "safe-agent: removed stale mount point '$stub'" >&2
+}
+
 # -b binds are optional host config (an agent's settings, plugins, skills). Any
 # of them may be absent on a given machine, so warn and skip rather than aborting
 # the jail — a hard --ro-bind here took the whole sandbox down over one missing
-# settings file. Explicit access grants (-d/-r) still fail loudly on a typo.
+# settings file. Explicit access grants (-d/-r) still fail loudly on a typo, which
+# is what to use for something the jail cannot do its job without, such as the
+# agent's own binary.
 for spec in "${extra_bind_ro[@]}"; do
   src="${spec%%:*}"
   dst="${spec#*:}"
   if [ ! -e "$src" ]; then
     echo "safe-agent: warning: -b source '$src' does not exist; skipping" >&2
+    prune_stale_mount_point "$dst"
     continue
   fi
   args+=(--ro-bind "$src" "$dst")
@@ -249,6 +284,31 @@ if [ ${#bare_patterns[@]} -gt 0 ]; then
 fi
 shopt -u nullglob dotglob globstar
 
+# Masks above are a snapshot: one bind per path that exists right now. A jail
+# that runs for hours sees .env files copied in, renamed, or checked out in new
+# worktrees long after it, and none of them would be covered. safe-agent-watch
+# follows the jail instead (see that file). It masks with a bind of this empty
+# file; bwrap's --ro-bind-data files are unlinked, and the kernel will not bind
+# from an unlinked file.
+watcher="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/safe-agent-watch"
+watch_empty=/run/safe-agent/empty
+if [ "$watch_masks" = 1 ] && [ "$grant_cwd" = 1 ] && [ ${#bare_patterns[@]} -gt 0 ]; then
+  if ! command -v python3 >/dev/null 2>&1 || [ ! -f "$watcher" ]; then
+    echo "safe-agent: warning: python3 or safe-agent-watch missing; masks cover only files present at launch" >&2
+    watch_masks=0
+  else
+    host_empty="$STATE_DIR/empty"
+    if [ ! -f "$host_empty" ] || [ -L "$host_empty" ] || [ -s "$host_empty" ]; then
+      rm -f -- "$host_empty"
+      : >"$host_empty"
+      chmod 444 "$host_empty"
+    fi
+    args+=(--ro-bind "$host_empty" "$watch_empty")
+  fi
+else
+  watch_masks=0
+fi
+
 # Apply masks. Skip any path nested under another masked directory — binding
 # inside a freshly-created tmpfs is pointless and can fail.
 for abs in "${mask_paths[@]}"; do
@@ -262,7 +322,11 @@ for abs in "${mask_paths[@]}"; do
   if [ -d "$abs" ]; then
     args+=(--tmpfs "$abs")
   else
-    args+=(--ro-bind /dev/null "$abs")
+    # Git cannot hash a character device such as a bind-mounted /dev/null.
+    # Copy EOF into a private regular file and mount it read-only instead.
+    # bwrap consumes each descriptor, so every mask needs its own open fd.
+    exec {mask_fd}</dev/null
+    args+=(--ro-bind-data "$mask_fd" "$abs")
   fi
 done
 
@@ -270,7 +334,6 @@ if [ "$allow_net" = 0 ]; then
   args+=(--unshare-net)
 fi
 
-args+=(--clearenv)
 
 # WSLg audio: clients normally reach PulseAudio via /run/user/$UID/pulse/native,
 # a symlink into /mnt/wslg/runtime-dir that the sandbox's tmpfs /run wipes out.
@@ -287,21 +350,136 @@ preserve=(HOME USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE TZ
           SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS
           HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
           http_proxy https_proxy all_proxy no_proxy)
+
+# WSL inherits Windows PATH entries even when the corresponding DrvFS mount is
+# intentionally absent. Do not hand jailed programs a list of executable paths
+# that can never resolve (and that misleadingly suggests /mnt/c is exposed).
+if [ -n "${PATH-}" ]; then
+  sanitized_path=""
+  IFS=: read -r -a path_entries <<<"$PATH"
+  for path_entry in "${path_entries[@]}"; do
+    case "$path_entry" in /mnt/c|/mnt/c/*) continue ;; esac
+    if [ -n "$sanitized_path" ]; then
+      sanitized_path+=":$path_entry"
+    else
+      sanitized_path="$path_entry"
+    fi
+  done
+  PATH="$sanitized_path"
+fi
+# The jail's environment travels in bwrap's environment, not as --setenv on its
+# command line. Any process on the host can read another's argv through ps or
+# /proc/PID/cmdline, but only the same user can read its environ — and -e is how
+# secrets such as GH_TOKEN get in.
+jail_env=()
 for var in "${preserve[@]}" "${extra_envs[@]}"; do
   if [ -n "${!var-}" ]; then
-    args+=(--setenv "$var" "${!var}")
+    jail_env+=("$var=${!var}")
   fi
 done
-args+=(--setenv SAFE_AGENT 1)
-args+=(--setenv SAFE_AGENT_JAIL "${jail_name:-ephemeral}")
+jail_env+=(SAFE_AGENT=1)
+jail_env+=("SAFE_AGENT_JAIL=${jail_name:-ephemeral}")
 
 if [ "$dry_run" = 1 ]; then
   # Masks are the fiddly part (extglob, globstar, nesting). Printing the argv is
   # the only way to see what a pattern actually resolved to before trusting it.
-  printf 'bwrap'
+  printf 'env -i'
+  printf ' %q' "${jail_env[@]}"
+  printf ' bwrap'
   printf ' %q' "${args[@]}" "${cmd[@]}"
   printf '\n'
   exit 0
 fi
 
+# A named jail's home fills up with the mount points bwrap creates for each
+# launch's binds — a skeleton of every directory the jail was started from
+# (~/work/repo, its .git, a worktree's .git/worktrees/NAME). Covered while
+# that bind is applied, they are left behind as empty directories once it is
+# not, so a jail launched from elsewhere sees an empty ~/work/repo where there
+# should be nothing. Each launch records the mount points it adds, derived from
+# what it binds, and the next launch removes the ones that are still empty.
+#
+# Never while another session of the same jail is running: removing a mount
+# point that is in use detaches that session's bind, and its repo vanishes out
+# from under it. Every session holds a shared lock for its whole life — the
+# descriptor survives the exec into bwrap — and only a launch that can take it
+# exclusively cleans up.
+record_mount_points() {
+  local dst p stub
+  for dst in "$@"; do
+    case "$dst" in "$HOME"/*) ;; *) continue ;; esac
+    p="$dst"
+    while [ "$p" != "$HOME" ]; do
+      stub="$jail_home/${p#"$HOME"/}"
+      # The destination itself is a mount point whether or not a previous
+      # launch left it behind; its parents are only ours if bwrap creates them.
+      if [ "$p" != "$dst" ] && { [ -e "$stub" ] || [ -L "$stub" ]; }; then
+        break
+      fi
+      printf '%s\0' "$stub"
+      p="${p%/*}"
+    done
+  done >>"$mount_point_log"
+}
+
+# Deepest first, so a directory empties before its parent is tried. Only ever
+# removes an empty directory or an empty regular file inside the jail home;
+# anything the agent has since filled is kept, and retried next time.
+prune_mount_points() {
+  local stub
+  local kept=()
+  [ -s "$mount_point_log" ] || return 0
+  while IFS= read -r -d '' stub; do
+    case "$stub" in "$jail_home"/*) ;; *) continue ;; esac
+    if [ -L "$stub" ]; then
+      :
+    elif [ -d "$stub" ]; then
+      rmdir -- "$stub" 2>/dev/null && continue
+    elif [ -f "$stub" ] && [ ! -s "$stub" ]; then
+      rm -f -- "$stub" && continue
+    fi
+    if [ -e "$stub" ] || [ -L "$stub" ]; then
+      kept+=("$stub")
+    fi
+  done < <(LC_ALL=C sort -zru "$mount_point_log")
+  if [ ${#kept[@]} -gt 0 ]; then
+    printf '%s\0' "${kept[@]}" >"$mount_point_log"
+  else
+    : >"$mount_point_log"
+  fi
+}
+
+if [ -n "$jail_home" ] && command -v flock >/dev/null 2>&1; then
+  mount_point_log="$STATE_DIR/$jail_name/mount-points"
+  : >>"$STATE_DIR/$jail_name/jail.lock"
+  # Read-only: the jailed agent inherits this descriptor, and needs no more.
+  exec {jail_lock_fd}<"$STATE_DIR/$jail_name/jail.lock"
+  if flock -n -x "$jail_lock_fd"; then
+    prune_mount_points
+  fi
+  flock -s "$jail_lock_fd"
+  bind_dsts=()
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[i]}" in
+      --bind|--ro-bind|--bind-try|--ro-bind-try|--ro-bind-data) bind_dsts+=("${args[i+2]}") ;;
+      --tmpfs) bind_dsts+=("${args[i+1]}") ;;
+    esac
+  done
+  record_mount_points "${bind_dsts[@]}"
+fi
+
+# Started here, while the host environment (PATH for python3 and bash) is still
+# in place. bwrap reports the sandbox PID on the pipe once it exists.
+if [ "$watch_masks" = 1 ]; then
+  exec {watch_fd}> >(exec python3 "$watcher" "$watch_empty" "$cwd" "${bare_patterns[@]}")
+  args+=(--info-fd "$watch_fd")
+fi
+
+# Start bwrap with exactly the jail's environment, which it hands on unchanged.
+while IFS= read -r var; do
+  export -n "$var" 2>/dev/null || true
+done < <(compgen -e)
+for kv in "${jail_env[@]}"; do
+  export "$kv"
+done
 exec bwrap "${args[@]}" "${cmd[@]}"

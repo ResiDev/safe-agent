@@ -1,0 +1,273 @@
+#!/bin/bash
+# vault — one encrypted 7z file you can edit in place.
+#
+#   vault              list what is in it
+#   vault edit FILE    open FILE in your editor, re-encrypt on save
+#   vault add FILE     put a file in
+#
+# There is no unlocked state. Plaintext exists only while a command is running,
+# only under /dev/shm (tmpfs, RAM-backed), and is wiped when the command exits —
+# including on ctrl-C. Nothing unencrypted is ever written to disk.
+#
+# The archive is AES-256 with -mhe=on, which encrypts the *headers* too. Without
+# it `7z l` lists every filename with no password at all, leaking the shape of
+# the vault (names like aws-prod.pem) even though the contents are safe.
+#
+# One self-contained file, so it is safe to sync or upload: without the
+# passphrase it reveals neither contents nor filenames.
+#
+# Companion to safe-agent rather than part of it. Agent jails get a tmpfs $HOME,
+# so the archive is not visible inside one. This covers the other half — agents
+# running unsandboxed on the host as your own user, which can read any file you
+# can. The gate is a passphrase, because no permission bit keeps a process away
+# from files owned by the uid it runs as.
+
+set -euo pipefail
+
+ARCHIVE="${VAULT_ARCHIVE:-$HOME/vault.7z}"
+SEVENZ_OPTS=(-mhe=on -mx=9 -bso0 -bsp0)
+EDITOR_CMD="${VAULT_EDITOR:-${VISUAL:-${EDITOR:-}}}"
+if [ -z "$EDITOR_CMD" ]; then
+  command -v nvim >/dev/null 2>&1 && EDITOR_CMD=nvim || EDITOR_CMD=vi
+fi
+PW=""
+
+LOCKFILE="$ARCHIVE.lock"
+
+# Two sessions open at once will silently clobber each other: each one re-adds
+# its whole scratch dir on exit, so whoever exits last wins and the other's work
+# is gone. Writers take an exclusive lock for their whole run; readers (ls, cat,
+# get) do not need one. Held on fd 9, so the kernel drops it when we exit, even
+# on a kill — no stale lock to clean up by hand.
+take_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  # Braces, not `exec 9>… 2>/dev/null`: on exec the redirections apply to the
+  # shell itself and persist, so that form silently discards stderr for the rest
+  # of the run — every later error message vanishes. Grouping scopes the 2>
+  # to this one statement while fd 9 still survives it.
+  { exec 9>"$LOCKFILE"; } 2>/dev/null || return 0
+  flock -n 9 && return 0
+  echo "vault: another vault session already has $ARCHIVE open — close it first" >&2
+  exit 1
+}
+
+work=""
+rcfile=""
+# Must end truthy: this runs on EXIT, and a trap whose last command fails takes
+# the script's exit status down with it.
+# Defaults everywhere: this is the one function that must never fail. It runs
+# under `set -u` on EXIT, and an unbound variable here aborts the trap before the
+# rm -rf, stranding decrypted plaintext in /dev/shm — which is exactly what a
+# missing `rcfile=""` did once.
+cleanup() {
+  [ -n "${rcfile:-}" ] && rm -f "${rcfile:-}"
+  [ -n "${work:-}" ] && rm -rf "${work:-}"
+  return 0
+}
+trap cleanup EXIT INT TERM
+
+# 7z recreates the archive on every write (`a`, `u`, and `d` alike), which
+# resets it to the default 0644 — world-readable ciphertext. Harmless in theory,
+# but there is no reason to hand anyone the file to attack offline at leisure.
+protect_archive() { [ -f "$ARCHIVE" ] && chmod 600 "$ARCHIVE"; return 0; }
+
+mkwork() {
+  work="$(mktemp -d /dev/shm/vault.XXXXXXXX)"
+  chmod 700 "$work"
+}
+
+# Read once, reuse for every 7z call in this invocation. `read -rs` takes the
+# terminal when interactive and a piped line when not, so this stays testable.
+read_password() {
+  printf '%s' "${1:-Password: }" >&2
+  read -rs PW
+  printf '\n' >&2
+}
+
+# Creating an archive SETS the password rather than checking one, so a typo would
+# encrypt the data under a string nobody knows. 7z would normally ask twice when
+# creating, but pw7z answers every prompt identically, so that safety net is
+# bypassed and the confirmation has to happen here.
+read_new_password() {
+  local confirm
+  read_password "New vault password: "
+  printf 'Confirm password: ' >&2
+  read -rs confirm
+  printf '\n' >&2
+  [ "$PW" = "$confirm" ] || { echo "vault: passwords do not match" >&2; exit 1; }
+  [ -n "$PW" ] || { echo "vault: refusing to use an empty password" >&2; exit 1; }
+}
+
+# Prompt appropriately for whether this command will create the archive.
+unlock_or_create() {
+  if [ -f "$ARCHIVE" ]; then read_password; else read_new_password; fi
+}
+
+need_archive() {
+  [ -f "$ARCHIVE" ] && return 0
+  echo "vault: no archive at $ARCHIVE — create one with: vault add FILE" >&2
+  exit 1
+}
+
+# 7z asks for the password a variable number of times — once to open an existing
+# archive, again to verify when creating one — so feed several copies and let it
+# take what it needs. printf is a bash builtin, so unlike `-p<pw>` or `yes <pw>`
+# the password never lands in any process's argv where `ps` could read it.
+#
+# Note the asymmetry in 7z's own flag: `-p` with no value means *prompt* for `a`
+# and `u`, but means *the empty password* for `l` and `x`. So writes pass it and
+# reads must not — a read with a trailing -p fails as "Wrong password?" even
+# when the password is right, because it never asked.
+pw7z() { printf '%s\n%s\n%s\n%s\n' "$PW" "$PW" "$PW" "$PW" | 7z "$@"; }
+
+# Called both as help (code 0, stdout) and as a rejection (non-zero, stderr) —
+# a usage message printed to stdout on error gets swallowed by a caller that is
+# redirecting output, and exiting 0 there makes a typo look like success.
+# `exit` is ambiguous when the vault shell looks like every other shell, so give
+# it a distinct prompt. The rcfile has to live outside $work — anything left in
+# there is re-encrypted into the archive on exit.
+run_vault_shell() {
+  local rc
+  case "$(basename "${SHELL:-bash}")" in
+    bash)
+      rc="$(mktemp /dev/shm/vault-rc.XXXXXXXX)"
+      rcfile="$rc"
+      cat >"$rc" <<'RC'
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+PS1='\[\e[1;33m\][vault]\[\e[0m\] '"$PS1"
+RC
+      VAULT_SH=1 bash --rcfile "$rc" -i
+      ;;
+    *)
+      # A non-bash $SHELL gets no prompt injection; the marker is still exported.
+      VAULT_SH=1 exec "${SHELL:-/bin/bash}"
+      ;;
+  esac
+}
+
+usage() {
+  local code="${1:-0}"
+  { cat <<MSG
+usage: vault [CMD [ARG...]]
+  (no args)      List what is in the vault
+  edit FILE      Edit FILE in $EDITOR_CMD, re-encrypting on save (creates if new)
+  add SRC...     Add files or directories
+  cat FILE       Print FILE
+  get FILE [DST] Extract FILE to DST (default: current directory)
+  rm FILE...     Delete FILE from the vault
+  sh             Shell with everything unpacked in RAM; re-encrypts on exit
+
+Archive: $ARCHIVE   (override with \$VAULT_ARCHIVE)
+Editor:  $EDITOR_CMD   (override with \$VAULT_EDITOR)
+MSG
+  } >&"$([ "$code" -eq 0 ] && echo 1 || echo 2)"
+  exit "$code"
+}
+
+cmd="${1:-ls}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in -h|--help|help) usage 0 ;; esac
+
+command -v 7z >/dev/null 2>&1 || {
+  echo "vault: 7z not found. Install it with: sudo apt install 7zip" >&2
+  exit 1
+}
+
+case "$cmd" in
+  ls)
+    need_archive; read_password
+    pw7z l "$ARCHIVE"
+    ;;
+
+  edit)
+    [ $# -eq 1 ] || usage 1
+    file="$1"
+    take_lock
+    unlock_or_create
+    mkwork
+    if [ -f "$ARCHIVE" ]; then
+      # A file not in the archive is not an error: editing a new name creates it,
+      # the same way `vim newfile` does. 7z exits non-zero when nothing matched.
+      pw7z x "${SEVENZ_OPTS[@]}" -o"$work" "$ARCHIVE" "$file" 2>/dev/null || true
+    fi
+    mkdir -p "$work/$(dirname "$file")"
+    [ -e "$work/$file" ] || : >"$work/$file"
+    before="$(cksum <"$work/$file")"
+
+    # The editor inherits the real terminal: only 7z is ever fed from a pipe.
+    "$EDITOR_CMD" "$work/$file"
+
+    if [ "$before" = "$(cksum <"$work/$file")" ]; then
+      echo "vault: $file unchanged, archive not rewritten"
+      exit 0
+    fi
+    ( cd "$work" && pw7z u "${SEVENZ_OPTS[@]}" "$ARCHIVE" "$file" -p )
+    protect_archive
+    echo "vault: saved $file"
+    ;;
+
+  add)
+    [ $# -ge 1 ] || usage 1
+    take_lock
+    unlock_or_create
+    # Staged first so one `7z a` covers every source: 7z would otherwise store
+    # each argument's full path, turning ~/x/y.txt into a nested x/y.txt entry.
+    mkwork
+    cp -a "$@" "$work/"
+    ( cd "$work" && pw7z a "${SEVENZ_OPTS[@]}" "$ARCHIVE" . -p )
+    protect_archive
+    echo "vault: added $# item(s) to $ARCHIVE"
+    ;;
+
+  cat)
+    [ $# -ge 1 ] || usage 1
+    need_archive; read_password
+    mkwork
+    # Extracted to tmpfs rather than `x -so`, because 7z writes its password
+    # prompt to stdout — it would land in the middle of the file contents.
+    pw7z x "${SEVENZ_OPTS[@]}" -o"$work" "$ARCHIVE" "$@"
+    for f in "$@"; do cat "$work/$f"; done
+    ;;
+
+  get)
+    [ $# -ge 1 ] || usage 1
+    need_archive; read_password
+    pw7z x "${SEVENZ_OPTS[@]}" -o"${2:-.}" "$ARCHIVE" "$1"
+    echo "vault: extracted $1 to ${2:-.}"
+    ;;
+
+  rm)
+    [ $# -ge 1 ] || usage 1
+    take_lock
+    need_archive; read_password
+    pw7z d "${SEVENZ_OPTS[@]}" "$ARCHIVE" "$@"
+    protect_archive
+    echo "vault: removed $# item(s)"
+    ;;
+
+  sh)
+    take_lock
+    need_archive; read_password
+    mkwork
+    pw7z x "${SEVENZ_OPTS[@]}" -o"$work" "$ARCHIVE"
+    echo "vault: unpacked into $work (RAM) — exit the shell to re-encrypt and wipe"
+    # Non-zero exit from the shell (ctrl-D after a failed command) must not skip
+    # the re-encrypt, or edits made in there would be silently discarded.
+    ( cd "$work" && run_vault_shell ) || true
+
+    # Re-adding an empty directory replaces the archive with an empty one, and
+    # 7z drops the encryption with it — the vault silently becomes a 32-byte
+    # unencrypted stub. Deleting everything is what `vault rm` is for.
+    if [ -z "$(find "$work" -mindepth 1 -print -quit)" ]; then
+      echo "vault: scratch dir is empty — archive left as it was" >&2
+      echo "vault: (to empty the vault deliberately, use: vault rm FILE)" >&2
+      exit 1
+    fi
+    ( cd "$work" && pw7z a "${SEVENZ_OPTS[@]}" "$ARCHIVE" . -p )
+    protect_archive
+    echo "vault: re-encrypted and wiped"
+    ;;
+
+  *) echo "vault: unknown command '$cmd'" >&2; usage 1 ;;
+esac

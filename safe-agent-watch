@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""safe-agent-watch — mask files that appear in a running jail.
+
+safe-agent's -m masks are bind mounts placed at launch, one per path that exists
+then. A long-lived jail outlives that snapshot: a `.env.local` copied in, a file
+renamed to `.env`, or a fresh worktree all appear under names nothing covers.
+An editor that saves by renaming over a masked file swaps the inode out from
+under its mount, so even a covered name can come back.
+
+This helper follows the jail for its whole life. It watches CWD with inotify and
+binds an empty read-only file over every new file whose basename matches a bare
+-m pattern (a tmpfs over a directory), inside the jail's own mount namespace. It
+covers bare-name patterns only; path-style and absolute masks stay launch-time.
+
+    safe-agent-watch EMPTY ROOT PATTERN [PATTERN...]
+
+EMPTY is an empty file as the jail sees it, ROOT the directory to watch. The
+bwrap --info-fd JSON arrives on stdin. Patterns are matched by bash, so extglob
+such as '.env!(.test)' means exactly what it does for the launch-time masks.
+
+There is a window of a few milliseconds between a file appearing and its mask
+landing; whatever the jail reads in it, it sees.
+"""
+import ctypes
+import fcntl
+import os
+import re
+import select
+import signal
+import struct
+import subprocess
+import sys
+
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+IN_Q_OVERFLOW = 0x00004000
+IN_IGNORED = 0x00008000
+IN_ONLYDIR = 0x01000000
+IN_DONT_FOLLOW = 0x02000000
+IN_EXCL_UNLINK = 0x04000000
+IN_ISDIR = 0x40000000
+IN_CLOEXEC = 0o2000000
+WATCH_MASK = IN_CREATE | IN_MOVED_TO | IN_ONLYDIR | IN_DONT_FOLLOW | IN_EXCL_UNLINK
+
+MS_BIND = 0x1000
+NS_GET_USERNS = 0xB701
+
+# Same pruning as the launch-time walk in safe-agent.
+PRUNE = {"node_modules", ".git"}
+
+libc = ctypes.CDLL(None, use_errno=True)
+warned_watch_limit = False
+
+
+def warn(msg):
+    print(f"safe-agent-watch: {msg}", file=sys.stderr, flush=True)
+
+
+def child_pid():
+    # bwrap writes {"child-pid": N, ...} once the sandbox exists. EOF first means
+    # bwrap never got that far, and there is nothing to watch.
+    text = ""
+    for line in sys.stdin:
+        text += line
+        m = re.search(r'"child-pid"\s*:\s*(\d+)', text)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+class Matcher:
+    """Bare-name pattern test, delegated to bash so extglob behaves as at launch."""
+
+    SCRIPT = r'''
+shopt -s extglob
+while IFS= read -r -d '' name; do
+  hit=0
+  for pat in "$@"; do
+    case "$name" in $pat) hit=1; break ;; esac
+  done
+  printf '%s' "$hit"
+done
+'''
+
+    def __init__(self, patterns):
+        self.proc = subprocess.Popen(
+            ["bash", "-c", self.SCRIPT, "bash", *patterns],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        # Most names in a tree cannot match: everything before the first extglob
+        # group is a literal prefix. Skip the round trip for those.
+        self.prefixes = tuple(re.split(r"[?*+@!]\(|[*?\[]", p, maxsplit=1)[0] for p in patterns)
+
+    def __call__(self, name):
+        if not name.startswith(self.prefixes):
+            return False
+        self.proc.stdin.write(name.encode() + b"\0")
+        self.proc.stdin.flush()
+        return self.proc.stdout.read(1) == b"1"
+
+
+class Jail:
+    """Mount operations inside a running jail's mount namespace."""
+
+    def __init__(self, pid):
+        # Everything that names the jail by host PID is opened before leaving the
+        # host's root, so it keeps working from inside the jail's.
+        root = os.open(f"/proc/{pid}/root", os.O_RDONLY | os.O_DIRECTORY)
+        mnt = os.open(f"/proc/{pid}/ns/mnt", os.O_RDONLY)
+        self.mountinfo = os.open(f"/proc/{pid}/mountinfo", os.O_RDONLY)
+        self.pidfd = os.pidfd_open(pid)
+        # bwrap builds the mounts in one user namespace and then runs the command
+        # in a nested one. Mount rights come from the namespace that owns the
+        # mount namespace, so join that, not the one the jailed process is in.
+        owner = fcntl.ioctl(mnt, NS_GET_USERNS)
+        os.setns(owner, os.CLONE_NEWUSER)
+        os.setns(mnt, os.CLONE_NEWNS)
+        os.fchdir(root)
+        os.chroot(".")
+        for fd in (root, mnt, owner):
+            os.close(fd)
+
+    def mount_points(self):
+        os.lseek(self.mountinfo, 0, os.SEEK_SET)
+        data = b""
+        while chunk := os.read(self.mountinfo, 65536):
+            data += chunk
+        points = set()
+        for line in data.decode(errors="surrogateescape").splitlines():
+            field = line.split(" ")[4]
+            points.add(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field))
+        return points
+
+    def mask(self, path, empty, is_dir):
+        # Already covered — by a launch-time mask or an earlier event. Checked
+        # afresh each time: renaming over a masked file detaches its mount.
+        if path in self.mount_points():
+            return
+        if is_dir:
+            rc = libc.mount(b"tmpfs", path.encode(), b"tmpfs", 0, b"mode=0755")
+        else:
+            # The bind carries EMPTY's read-only flag with it.
+            rc = libc.mount(empty.encode(), path.encode(), None, MS_BIND, None)
+        if rc != 0:
+            err = ctypes.get_errno()
+            # Gone again, or a symlink to somewhere the jail cannot see: either
+            # way there is nothing left in the jail to hide.
+            if err not in (2, 20):  # ENOENT, ENOTDIR
+                warn(f"could not mask {path}: {os.strerror(err)}")
+
+
+class Watcher:
+    def __init__(self, jail, matcher, empty):
+        self.jail = jail
+        self.matches = matcher
+        self.empty = empty
+        self.fd = libc.inotify_init1(IN_CLOEXEC)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1")
+        self.paths = {}
+
+    def consider(self, path, is_dir):
+        """Mask PATH if its name matches. True when it was masked."""
+        if not self.matches(os.path.basename(path)):
+            return False
+        self.jail.mask(path, self.empty, is_dir)
+        return True
+
+    def watch(self, top):
+        # Watch each directory before listing it, so a file created in between
+        # shows up either in the listing or as an event — never neither. Re-adding
+        # a watch on a renamed directory returns its old descriptor, which
+        # repoints it here.
+        global warned_watch_limit
+        stack = [top]
+        while stack:
+            d = stack.pop()
+            wd = libc.inotify_add_watch(self.fd, d.encode(), WATCH_MASK)
+            if wd < 0:
+                if ctypes.get_errno() == 28 and not warned_watch_limit:  # ENOSPC
+                    warned_watch_limit = True
+                    warn("inotify watch limit reached; new files in unwatched "
+                         "directories will not be masked "
+                         "(raise fs.inotify.max_user_watches)")
+                continue
+            self.paths[wd] = d
+            try:
+                entries = list(os.scandir(d))
+            except OSError:
+                continue
+            for e in entries:
+                if e.name in PRUNE:
+                    continue
+                is_dir = e.is_dir(follow_symlinks=False)
+                if self.consider(e.path, is_dir):
+                    continue
+                if is_dir:
+                    stack.append(e.path)
+
+    def handle(self, buf):
+        off = 0
+        while off < len(buf):
+            wd, mask, _cookie, length = struct.unpack_from("iIII", buf, off)
+            name = buf[off + 16:off + 16 + length].rstrip(b"\0").decode(errors="surrogateescape")
+            off += 16 + length
+            if mask & IN_Q_OVERFLOW:
+                # Events were dropped; the only safe recovery is a full rescan.
+                self.watch(self.root)
+                continue
+            if mask & IN_IGNORED:
+                self.paths.pop(wd, None)
+                continue
+            parent = self.paths.get(wd)
+            if parent is None or not name or name in PRUNE:
+                continue
+            path = os.path.join(parent, name)
+            is_dir = bool(mask & IN_ISDIR)
+            if not self.consider(path, is_dir) and is_dir:
+                # A new or moved-in directory may arrive already populated, as a
+                # worktree checkout does.
+                self.watch(path)
+
+    def run(self, root):
+        self.root = root
+        self.watch(root)
+        while True:
+            ready, _, _ = select.select([self.fd, self.jail.pidfd], [], [])
+            if self.jail.pidfd in ready:
+                return
+            self.handle(os.read(self.fd, 65536))
+
+
+def main():
+    empty, root, patterns = sys.argv[1], sys.argv[2], sys.argv[3:]
+    # Ctrl-C and Ctrl-Z in the terminal are meant for the agent, which carries on
+    # after them. A watcher that died with it would leave the jail unguarded.
+    for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP):
+        signal.signal(sig, signal.SIG_IGN)
+    pid = child_pid()
+    if pid is None:
+        return 0
+    sys.stdin.close()
+    matcher = Matcher(patterns)
+    try:
+        jail = Jail(pid)
+    except OSError as e:
+        # A command that has already exited leaves nothing to guard.
+        if os.path.exists(f"/proc/{pid}"):
+            warn(f"cannot enter the jail ({e}); masks cover only files present at launch")
+        return 1
+    Watcher(jail, matcher, empty).run(root)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

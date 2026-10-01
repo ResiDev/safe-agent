@@ -1,0 +1,91 @@
+#!/bin/bash
+# Export a Windows clipboard image to the sandbox-visible screenshots directory.
+# This is deliberately a host-side helper: it needs WSL interop and must never
+# be given access to the Windows filesystem from inside a safe-agent jail.
+#
+# Default: copy the PNG's pathname as text, for terminal agents (sclaude,
+# scodex). With --gui: put the PNG itself on the WSLg clipboard, for GUI apps
+# in a jail (st3), whose composers attach pasted images but not pasted paths.
+set -euo pipefail
+
+usage() { echo "usage: pasteshot [--gui]" >&2; exit 64; }
+
+gui=
+case "${1-}" in
+  "") ;;
+  -g|--gui) gui=1 ;;
+  *) usage ;;
+esac
+[ "$#" -le 1 ] || usage
+
+if [ -n "${SAFE_AGENT-}" ]; then
+  echo "pasteshot: must be run outside Safe Agent" >&2
+  exit 1
+fi
+
+for dependency in powershell.exe clip.exe base64; do
+  if ! command -v "$dependency" >/dev/null 2>&1; then
+    echo "pasteshot: $dependency not found; run this helper from a WSL host shell" >&2
+    exit 1
+  fi
+done
+
+# Windows -> WSLg clipboard sync does not reliably carry images, so a GUI app
+# may never see a Windows screenshot. Hand the PNG to the Linux clipboard instead;
+# jailed Wayland clients share the same WSLg compositor.
+if [ -n "$gui" ]; then
+  if command -v wl-copy >/dev/null 2>&1 && [ -n "${WAYLAND_DISPLAY-}" ]; then
+    linux_copy=(wl-copy --type image/png)
+  elif command -v xclip >/dev/null 2>&1 && [ -n "${DISPLAY-}" ]; then
+    linux_copy=(xclip -selection clipboard -t image/png -i)
+  else
+    echo "pasteshot: --gui needs wl-copy or xclip; sudo apt install wl-clipboard" >&2
+    exit 1
+  fi
+fi
+
+umask 077
+output_dir="$HOME/screenshots"
+mkdir -p "$output_dir"
+output_path="$output_dir/screenshot-$(date +%Y%m%d-%H%M%S-%N).png"
+
+# Stream base64 rather than passing a \\wsl.localhost path after -Command.
+# Windows PowerShell 5 treats that trailing value as more command text instead
+# of populating $args, causing Image.Save(null, ...) and then trying to execute
+# the pathname as a command.
+cleanup_incomplete() { rm -f "$output_path"; }
+trap cleanup_incomplete ERR
+
+powershell.exe -NoProfile -NonInteractive -STA -Command '
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type -AssemblyName System.Drawing
+
+  $image = [Windows.Forms.Clipboard]::GetImage()
+  if ($null -eq $image) {
+    [Console]::Error.WriteLine("pasteshot: no image found in Windows clipboard")
+    exit 2
+  }
+
+  $stream = New-Object System.IO.MemoryStream
+  try {
+    $image.Save($stream, [Drawing.Imaging.ImageFormat]::Png)
+    [Console]::Out.Write([Convert]::ToBase64String($stream.ToArray()))
+  }
+  finally {
+    $stream.Dispose()
+    $image.Dispose()
+  }
+' | tr -d '\r\n' | base64 --decode >"$output_path"
+
+trap - ERR
+
+# The jailed agent never touches the Windows clipboard or receives general
+# access to /mnt/c. Both copy tools fork a background owner that serves the
+# selection until something else is copied.
+if [ -n "$gui" ]; then
+  "${linux_copy[@]}" <"$output_path"
+else
+  # WezTerm can now paste ordinary text.
+  printf '%s' "$output_path" | clip.exe
+fi
+printf '%s\n' "$output_path"

@@ -27,6 +27,27 @@ mkdir -p "$bindir"
 ln -sfn "$repo/safe-agent" "$bindir/safe-agent"
 echo "linked $bindir/safe-agent -> $repo/safe-agent"
 
+ln -sfn "$repo/vault" "$bindir/vault"
+echo "linked $bindir/vault -> $repo/vault"
+
+ln -sfn "$repo/pasteshot" "$bindir/pasteshot"
+echo "linked $bindir/pasteshot -> $repo/pasteshot"
+
+# safe-agent warns rather than silently omitting this optional bind. Creating it
+# at install time makes the host export directory available from the first run.
+mkdir -p "$HOME/screenshots"
+echo "screenshots will be exported through $HOME/screenshots"
+
+# vault is a companion, not a dependency: safe-agent itself never calls it, so a
+# missing 7z is a note rather than the hard failure bwrap gets above.
+command -v 7z >/dev/null 2>&1 || \
+  echo "note: 7z not found, so \`vault\` will not run. Install it with: sudo apt install 7zip"
+
+# Without python3, masks still apply at launch but files that appear later are
+# not masked; safe-agent warns about that on every launch.
+command -v python3 >/dev/null 2>&1 || \
+  echo "note: python3 not found, so masks will not cover files created after launch"
+
 [ -e "$bashrc" ] || : >"$bashrc"
 
 if grep -qF "$marker" "$bashrc" 2>/dev/null; then
