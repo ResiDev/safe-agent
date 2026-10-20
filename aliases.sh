@@ -27,8 +27,9 @@ _safe_agent_gh_token() {
 #
 #   * .credentials.json — the OAuth token. Read-only lets the agent authenticate
 #     but not clobber or rewrite your host login.
-#   * settings / plugins / skills / commands / agents — config that decides what
-#     the *next* session on the host is allowed to do.
+#   * settings / plugins / skills / commands / agents / rules — config that
+#     decides what the *next* session on the host is allowed to do. Every .md in
+#     rules/ is loaded into each new session (pstack's model rule lives there).
 #
 # ~/.agents/skills is pinned for the same reason, and because it has to be: cross-
 # agent skill installers (npx skills add ...) unpack there and leave ~/.claude/skills
@@ -85,7 +86,8 @@ _safe_agent_claude_access() {
     -b "$HOME/.claude/skills:$HOME/.claude/skills" \
     -b "$HOME/.agents/skills:$HOME/.agents/skills" \
     -b "$HOME/.claude/commands:$HOME/.claude/commands" \
-    -b "$HOME/.claude/agents:$HOME/.claude/agents")
+    -b "$HOME/.claude/agents:$HOME/.claude/agents" \
+    -b "$HOME/.claude/rules:$HOME/.claude/rules")
 }
 
 sclaude() {

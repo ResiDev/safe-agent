@@ -691,6 +691,8 @@ test_alias_sclaude_pins_host_config() {
     "-b $home/.claude/settings.json:$home/.claude/settings.json"
   assert_contains "shared skills are pinned read-only for Claude" "$out" \
     "-b $home/.agents/skills:$home/.agents/skills"
+  assert_contains "rules are pinned read-only for Claude" "$out" \
+    "-b $home/.claude/rules:$home/.claude/rules"
   assert_contains "the standard masks are applied" "$out" "-m .env!(.test)"
   rm -rf "$home"
 }
