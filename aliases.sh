@@ -90,9 +90,44 @@ _safe_agent_claude_access() {
     -b "$HOME/.claude/rules:$HOME/.claude/rules")
 }
 
+# Claude's MCP server list lives in ~/.claude.json, outside ~/.claude, so each
+# named jail has its own copy in its persistent home. At every launch the host's
+# user-scope mcpServers replace the jail's. The host is the one source of truth:
+# a server added inside a jail lasts until the next launch and never reaches the
+# host. Project-scope servers are not copied.
+#
+# The file itself is never bound. Claude rewrites it constantly, so it can't be
+# read-only, and if it were writable a jail could add a stdio server that the
+# next unjailed claude would run on the host. Logins need no copying: MCP OAuth
+# tokens live in the pinned .credentials.json.
+#
+# The new copy is renamed into place, so a session already running in the jail
+# never reads half a file. That session may later write its stale list back;
+# the next launch fixes it. Any failure leaves the jail's copy untouched.
+_safe_agent_sync_mcp() {
+  local jail="$1" src="$HOME/.claude.json" dir dst tmp input=(-n)
+  [ -f "$src" ] || return 0
+  command -v jq >/dev/null 2>&1 || {
+    echo "safe-agent: jq not found; MCP servers not synced into the $jail jail" >&2
+    return 0
+  }
+  dir="${XDG_CACHE_HOME:-$HOME/.cache}/safe-agent/$jail/home"
+  dst="$dir/.claude.json"
+  mkdir -p "$dir" || return 0
+  [ -f "$dst" ] && input=("$dst")
+  tmp="$(mktemp "$dst.XXXXXX")" || return 0
+  if jq --slurpfile host "$src" '(. // {}) | .mcpServers = ($host[0].mcpServers // {})' \
+       "${input[@]}" >"$tmp" 2>/dev/null && mv -f "$tmp" "$dst"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  echo "safe-agent: could not sync MCP servers into the $jail jail; keeping its own" >&2
+}
+
 sclaude() {
   local access=()
   _safe_agent_claude_access access
+  _safe_agent_sync_mcp claude
   GH_TOKEN="$(_safe_agent_gh_token)" \
     safe-agent -j claude -e GH_TOKEN "${SAFE_AGENT_MASKS[@]}" "${access[@]}" \
       claude --dangerously-skip-permissions "$@"
@@ -216,6 +251,7 @@ st3() (
     if command -v t3code-update >/dev/null 2>&1; then
       t3code-update || echo "st3: update failed; launching the installed T3" >&2
     fi
+    _safe_agent_sync_mcp t3code
   fi
 
   launcher="$(command -v t3code)" || {

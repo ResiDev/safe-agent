@@ -119,6 +119,14 @@ read-only on top. `~/.codex/config.toml` is the one exception, because Codex
 also uses it as its trust store and writes it during normal operation; see
 [`docs/residual-risks.md`](docs/residual-risks.md).
 
+Claude's MCP server list lives in `~/.claude.json`, which each jail keeps its
+own copy of. `sclaude` and `st3` copy the host's user-scope `mcpServers` into
+it at launch (this needs `jq`). The host's list replaces the jail's, so a
+server added inside a jail lasts only until the next launch and never reaches
+the host. MCP logins carry over through the pinned credentials, so to add a
+server, run `claude mcp add` and authenticate it on the host, then relaunch the
+jail.
+
 `sclaude` additionally masks every *other* project's transcripts under
 `~/.claude/projects`, so a jail scoped to one repo can't read or delete the
 history of the rest. `scodex` cannot do the same — Codex keeps all sessions in

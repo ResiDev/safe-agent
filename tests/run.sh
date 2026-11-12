@@ -675,7 +675,7 @@ run_alias() {
   chmod +x "$stub/safe-agent" "$stub/npm" "$stub/t3code-update" \
     "$1/npm-root/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex" \
     "$1/npm-root/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex-code-mode-host"
-  out="$(HOME="$1" PATH="$stub:$PATH" bash -c ". '$repo/aliases.sh'; $2" 2>&1)"
+  out="$(HOME="$1" XDG_CACHE_HOME="$1/.cache" PATH="$stub:$PATH" bash -c ". '$repo/aliases.sh'; $2" 2>&1)"
   rm -rf "$stub"
   printf '%s' "$out"
 }
@@ -835,6 +835,48 @@ test_alias_st3_updates_before_launching() {
   assert_contains "a failed update still launches the installed T3" "$out" "-j t3code"
   out="$(PATH="$home/.local/bin:$PATH" run_alias "$home" 'st3 --dry-run')"
   assert_missing "dry runs never update" "$out" "t3code-update ran"
+  rm -rf "$home"
+}
+
+# The host's user-scope MCP servers replace each jail's at launch; nothing else
+# in the host's ~/.claude.json crosses over, and nothing flows back.
+test_alias_mcp_servers_sync_into_jails() {
+  local home out jail_cfg t3_cfg host_before
+  home="$(mktemp -d)"
+  mkdir -p "$home/.local/bin" "$home/apps/t3/squashfs-root" "$home/.cache/safe-agent/claude/home"
+  printf '#!/bin/bash\nexit 0\n' >"$home/apps/t3/squashfs-root/AppRun"
+  cp "$home/apps/t3/squashfs-root/AppRun" "$home/apps/t3/squashfs-root/t3code"
+  chmod +x "$home/apps/t3/squashfs-root/"{AppRun,t3code}
+  ln -s "$home/apps/t3/squashfs-root/AppRun" "$home/.local/bin/t3code"
+  printf '%s\n' '{"mcpServers":{"linear":{"type":"http","url":"https://mcp.example/mcp"}},
+    "projects":{"/host/only":{"allowedTools":["Bash"]}}}' >"$home/.claude.json"
+  host_before="$(cat "$home/.claude.json")"
+  jail_cfg="$home/.cache/safe-agent/claude/home/.claude.json"
+  t3_cfg="$home/.cache/safe-agent/t3code/home/.claude.json"
+  printf '%s\n' '{"numStartups":5,"mcpServers":{"rogue":{"command":"bash"}}}' >"$jail_cfg"
+
+  run_alias "$home" sclaude >/dev/null
+  assert_contains "the host's servers reach the jail" "$(jq -c .mcpServers "$jail_cfg")" '"linear"'
+  assert_missing "a server added in the jail is dropped" "$(jq -c .mcpServers "$jail_cfg")" rogue
+  assert_contains "the jail keeps its own state" "$(jq -c .numStartups "$jail_cfg")" 5
+  assert_missing "host project settings stay on the host" "$(cat "$jail_cfg")" /host/only
+  [ "$(cat "$home/.claude.json")" = "$host_before" ] &&
+    ok "the host's config is untouched" || bad "the host's config is untouched"
+  [ "$(stat -c %a "$jail_cfg")" = 600 ] &&
+    ok "the jail's copy stays private" || bad "the jail's copy stays private" "mode $(stat -c %a "$jail_cfg")"
+
+  PATH="$home/.local/bin:$PATH" run_alias "$home" 'st3 --dry-run' >/dev/null
+  [ ! -e "$t3_cfg" ] && ok "dry runs do not sync" || bad "dry runs do not sync"
+  PATH="$home/.local/bin:$PATH" run_alias "$home" st3 >/dev/null
+  assert_contains "a fresh T3 jail gets the host's servers" "$(jq -c .mcpServers "$t3_cfg" 2>&1)" '"linear"'
+
+  printf 'not json\n' >"$jail_cfg"
+  out="$(run_alias "$home" sclaude)"
+  assert_contains "a broken jail config is reported" "$out" "could not sync MCP servers"
+  assert_contains "a broken jail config is left alone" "$(cat "$jail_cfg")" "not json"
+  assert_contains "the jail still launches" "$out" "-j claude"
+  [ -z "$(find "$home/.cache/safe-agent/claude/home" -name '.claude.json.*')" ] &&
+    ok "no temp files are left behind" || bad "no temp files are left behind"
   rm -rf "$home"
 }
 
