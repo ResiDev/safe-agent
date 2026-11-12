@@ -8,6 +8,7 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 link="${HOME}/bin/safe-agent"
 vault_link="${HOME}/bin/vault"
 pasteshot_link="${HOME}/bin/pasteshot"
+t3code_update_link="${HOME}/bin/t3code-update"
 bashrc="${HOME}/.bashrc"
 state="${XDG_CACHE_HOME:-$HOME/.cache}/safe-agent"
 begin="# >>> safe-agent >>>"
@@ -37,6 +38,13 @@ if [ -L "$pasteshot_link" ] && [ "$(readlink -f "$pasteshot_link")" = "$repo/pas
   echo "removed $pasteshot_link"
 else
   echo "no symlink of ours at $pasteshot_link; leaving it alone"
+fi
+
+if [ -L "$t3code_update_link" ] && [ "$(readlink -f "$t3code_update_link")" = "$repo/t3code-update" ]; then
+  rm "$t3code_update_link"
+  echo "removed $t3code_update_link"
+else
+  echo "no symlink of ours at $t3code_update_link; leaving it alone"
 fi
 
 if [ -f "$bashrc" ] && grep -qF "$begin" "$bashrc"; then

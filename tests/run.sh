@@ -667,11 +667,12 @@ run_alias() {
   local stub out
   stub="$(mktemp -d)"
   printf '#!/bin/bash\necho "$@"\n' >"$stub/safe-agent"
+  printf '#!/bin/bash\necho "t3code-update ran"\nexit "${T3CODE_UPDATE_RC:-0}"\n' >"$stub/t3code-update"
   printf '#!/bin/bash\n[ "$1" = root ] && [ "$2" = -g ] && printf "%%s\\n" "$HOME/npm-root"\n' >"$stub/npm"
   mkdir -p "$1/npm-root/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin"
   : >"$1/npm-root/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
   : >"$1/npm-root/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex-code-mode-host"
-  chmod +x "$stub/safe-agent" "$stub/npm" \
+  chmod +x "$stub/safe-agent" "$stub/npm" "$stub/t3code-update" \
     "$1/npm-root/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex" \
     "$1/npm-root/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex-code-mode-host"
   out="$(HOME="$1" PATH="$stub:$PATH" bash -c ". '$repo/aliases.sh'; $2" 2>&1)"
@@ -813,6 +814,100 @@ test_alias_st3_shares_both_agent_policies() {
   exec {lock_fd}>&-
   out="$(XDG_CACHE_HOME="$home/.cache" PATH="$home/.local/bin:$PATH" run_alias "$home" st3)"
   assert_contains "T3 can launch after the prior lock is released" "$out" "-j t3code"
+  rm -rf "$home"
+}
+
+# st3 updates T3 before a real launch, under the launch lock, and still launches
+# the installed version when the update fails (offline, say).
+test_alias_st3_updates_before_launching() {
+  local home out
+  home="$(mktemp -d)"
+  mkdir -p "$home/.local/bin" "$home/apps/t3/squashfs-root"
+  printf '#!/bin/bash\nexit 0\n' >"$home/apps/t3/squashfs-root/AppRun"
+  cp "$home/apps/t3/squashfs-root/AppRun" "$home/apps/t3/squashfs-root/t3code"
+  chmod +x "$home/apps/t3/squashfs-root/"{AppRun,t3code}
+  ln -s "$home/apps/t3/squashfs-root/AppRun" "$home/.local/bin/t3code"
+  out="$(XDG_CACHE_HOME="$home/.cache" PATH="$home/.local/bin:$PATH" run_alias "$home" st3)"
+  assert_contains "st3 runs t3code-update before launching" "$out" "t3code-update ran"
+  assert_contains "st3 launches after updating" "$out" "-j t3code"
+  out="$(XDG_CACHE_HOME="$home/.cache" PATH="$home/.local/bin:$PATH" T3CODE_UPDATE_RC=1 run_alias "$home" st3)"
+  assert_contains "a failed update is reported" "$out" "update failed"
+  assert_contains "a failed update still launches the installed T3" "$out" "-j t3code"
+  out="$(PATH="$home/.local/bin:$PATH" run_alias "$home" 'st3 --dry-run')"
+  assert_missing "dry runs never update" "$out" "t3code-update ran"
+  rm -rf "$home"
+}
+
+# --- t3code-update ----------------------------------------------------------
+
+# make_t3_release DIR VERSION — a fake GitHub release tree for file:// URLs: the
+# latest-linux.yml manifest and an "AppImage" that extracts like the real one.
+make_t3_release() {
+  local d="$1" v="$2" app sha
+  app="T3-Code-$v-x86_64.AppImage"
+  mkdir -p "$d/latest/download" "$d/download/v$v"
+  {
+    printf '#!/bin/bash\n[ "$1" = --appimage-extract ] || exit 1\nmkdir -p squashfs-root\n'
+    printf "printf '#!/bin/bash\\\\necho t3 %s\\\\n' >squashfs-root/AppRun\n" "$v"
+    printf 'cp squashfs-root/AppRun squashfs-root/t3code\nchmod +x squashfs-root/AppRun squashfs-root/t3code\n'
+  } >"$d/download/v$v/$app"
+  sha="$(openssl dgst -sha512 -binary "$d/download/v$v/$app" | base64 -w0)"
+  printf 'version: %s\nfiles:\n  - url: T3-Code-%s-amd64.deb\n    sha512: debsum\npath: %s\nsha512: %s\n' \
+    "$v" "$v" "$app" "$sha" >"$d/latest/download/latest-linux.yml"
+}
+
+t3_update() {
+  local home="$1"
+  shift
+  HOME="$home" T3CODE_RELEASES="file://$home/releases" "$repo/t3code-update" "$@" 2>&1
+}
+
+test_t3_update_installs_and_replaces() {
+  local home out
+  home="$(mktemp -d)"
+  make_t3_release "$home/releases" 1.0.0
+  out="$(t3_update "$home" --check)"
+  assert_contains "--check reports an available release" "$out" "1.0.0 is available"
+  [ ! -e "$home/.local/bin/t3code" ] && ok "--check installs nothing" || bad "--check installs nothing"
+  t3_update "$home" >/dev/null
+  [ "$(readlink -f "$home/.local/bin/t3code")" = "$home/.local/opt/t3code-1.0.0/squashfs-root/AppRun" ] &&
+    ok "the launcher points at the extracted AppRun" || bad "the launcher points at the extracted AppRun"
+  assert_contains "the installed launcher runs" "$("$home/.local/bin/t3code")" "t3 1.0.0"
+  assert_missing "the downloaded AppImage is not kept" "$(ls -R "$home/.local/opt")" "AppImage"
+  out="$(t3_update "$home")"
+  [ -z "$out" ] && ok "an up-to-date install is silent" || bad "an up-to-date install is silent" "$out"
+  make_t3_release "$home/releases" 1.1.0
+  t3_update "$home" >/dev/null
+  assert_contains "a newer release replaces the launcher" "$("$home/.local/bin/t3code")" "t3 1.1.0"
+  [ ! -e "$home/.local/opt/t3code-1.0.0" ] && ok "the old installation is removed" ||
+    bad "the old installation is removed"
+  mkdir -p "$home/.local/opt/t3code-0.9.0"
+  t3_update "$home" --check >/dev/null
+  [ -d "$home/.local/opt/t3code-0.9.0" ] && ok "--check removes nothing" || bad "--check removes nothing"
+  t3_update "$home" >/dev/null
+  [ ! -e "$home/.local/opt/t3code-0.9.0" ] && ok "a leftover installation goes once current" ||
+    bad "a leftover installation goes once current"
+  rm -rf "$home"
+}
+
+test_t3_update_rejects_bad_checksum() {
+  local home out rc
+  home="$(mktemp -d)"
+  make_t3_release "$home/releases" 1.0.0
+  printf 'tampered\n' >>"$home/releases/download/v1.0.0/T3-Code-1.0.0-x86_64.AppImage"
+  out="$(t3_update "$home")"; rc=$?
+  [ "$rc" -ne 0 ] && ok "a checksum mismatch fails" || bad "a checksum mismatch fails"
+  assert_contains "a checksum mismatch is explained" "$out" "checksum mismatch"
+  [ ! -e "$home/.local/bin/t3code" ] && ok "a bad download installs nothing" || bad "a bad download installs nothing"
+  assert_missing "a bad download leaves no staging directory" "$(ls -A "$home/.local/opt")" ".t3code-update"
+  rm -rf "$home"
+}
+
+test_t3_update_refuses_inside_the_jail() {
+  local home out
+  home="$(mktemp -d)"
+  out="$(SAFE_AGENT=1 t3_update "$home")"
+  assert_contains "t3code-update refuses to run in a jail" "$out" "must be run outside Safe Agent"
   rm -rf "$home"
 }
 

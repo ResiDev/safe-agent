@@ -11,11 +11,20 @@ st3
 ```
 
 The wrapper resolves `t3code` on PATH, which must be a symlink to an extracted
-AppImage's `AppRun`. The current installation is under
-`~/.local/opt/t3code-0.0.39/squashfs-root`. To update, extract the new AppImage
-into a new version directory and repoint `~/.local/bin/t3code` to its `AppRun`.
-Both commands then use that installation. Updates happen outside the jail
-because the installation is mounted read-only.
+AppImage's `AppRun`. `t3code-update` maintains that installation: it reads
+`latest-linux.yml` from the latest stable GitHub release (nightlies and previews
+are pre-releases, so they are skipped), checks the AppImage against that file's
+sha512, extracts it to `~/.local/opt/t3code-<version>/squashfs-root`, repoints
+`~/.local/bin/t3code`, and removes older installations that nothing is running
+from. `t3code-update --check` only reports.
+
+`st3` runs `t3code-update` before each launch, under the launch lock, so T3 stays
+on the latest stable release without asking. Offline, or on any failure, it
+launches the installed version. `st3 --dry-run` never updates. Updates happen
+outside the jail because the installation is mounted read-only, which is also
+why T3's built-in updater cannot apply an update: it rewrites the `.AppImage` it
+was launched from, and there is none. Run `t3code-update` once by hand to
+install T3 on a new machine.
 
 `st3` uses the same access helpers as `sclaude` and `scodex`, including both
 agents' writable state directories, read-only credentials and configuration

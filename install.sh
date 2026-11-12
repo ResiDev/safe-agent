@@ -33,6 +33,9 @@ echo "linked $bindir/vault -> $repo/vault"
 ln -sfn "$repo/pasteshot" "$bindir/pasteshot"
 echo "linked $bindir/pasteshot -> $repo/pasteshot"
 
+ln -sfn "$repo/t3code-update" "$bindir/t3code-update"
+echo "linked $bindir/t3code-update -> $repo/t3code-update"
+
 # safe-agent warns rather than silently omitting this optional bind. Creating it
 # at install time makes the host export directory available from the first run.
 mkdir -p "$HOME/screenshots"

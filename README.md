@@ -26,7 +26,7 @@ sudo apt install bubblewrap      # Ubuntu 24.04 ships 0.9.0
 ./install.sh
 ```
 
-`install.sh` symlinks `safe-agent`, `vault`, and `pasteshot` into `~/bin`, creates
+`install.sh` symlinks `safe-agent`, `vault`, `pasteshot`, and `t3code-update` into `~/bin`, creates
 `~/screenshots`, and appends a
 sourcing block for `aliases.sh` to `~/.bashrc`. Both steps are idempotent.
 `./uninstall.sh` reverses them (add `--purge` to also delete the jails under

@@ -195,16 +195,6 @@ scodex() {
 # Resolve the host launcher each time so an AppImage update needs no alias edit.
 st3() (
   local launcher appdir state_dir launch_fd access=() options=()
-  launcher="$(command -v t3code)" || {
-    echo "st3: t3code is not on PATH; install the extracted AppImage first" >&2
-    return 1
-  }
-  launcher="$(readlink -f -- "$launcher")" || return
-  appdir="${launcher%/*}"
-  if [ "${launcher##*/}" != AppRun ] || [ ! -x "$appdir/t3code" ]; then
-    echo "st3: t3code must point to an extracted AppImage's AppRun" >&2
-    return 1
-  fi
   _safe_agent_claude_access access all
   _safe_agent_codex_access access st3 || return
   if [ "${1-}" = --dry-run ]; then
@@ -221,6 +211,22 @@ st3() (
       echo "st3: T3 is already running in this jail. Close that instance before launching from another project." >&2
       return 1
     }
+    # Under the lock, so no jailed T3 is running from the installation an
+    # update replaces. A failed update still launches what is installed.
+    if command -v t3code-update >/dev/null 2>&1; then
+      t3code-update || echo "st3: update failed; launching the installed T3" >&2
+    fi
+  fi
+
+  launcher="$(command -v t3code)" || {
+    echo "st3: t3code is not on PATH; run t3code-update to install it" >&2
+    return 1
+  }
+  launcher="$(readlink -f -- "$launcher")" || return
+  appdir="${launcher%/*}"
+  if [ "${launcher##*/}" != AppRun ] || [ ! -x "$appdir/t3code" ]; then
+    echo "st3: t3code must point to an extracted AppImage's AppRun" >&2
+    return 1
   fi
 
   # The host fnm/npm PATH lives under /run, which the jail replaces. Prefer the

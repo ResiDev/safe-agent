@@ -1,0 +1,121 @@
+#!/bin/bash
+# Install the latest stable T3 Code AppImage, extracted, for st3.
+#
+# st3 runs T3 from an extracted AppImage mounted read-only, so T3's own updater
+# (which rewrites the .AppImage it was launched from) can never apply an update.
+# This does the same job from the host: it reads latest-linux.yml from the
+# newest stable release (nightlies and previews are pre-releases, which
+# releases/latest skips), checks the AppImage against that file's sha512, and
+# extracts it to ~/.local/opt/t3code-<version>. ~/.local/bin/t3code is then
+# repointed at the new AppRun and the old installations are removed.
+#
+#   t3code-update           install the latest stable release if it is newer
+#   t3code-update --check   only report whether an update is available
+set -euo pipefail
+
+usage() { echo "usage: t3code-update [--check]" >&2; exit 64; }
+
+check=
+case "${1-}" in
+  "") ;;
+  -c|--check) check=1 ;;
+  *) usage ;;
+esac
+[ "$#" -le 1 ] || usage
+
+if [ -n "${SAFE_AGENT-}" ]; then
+  echo "t3code-update: must be run outside Safe Agent; the installation is read-only in the jail" >&2
+  exit 1
+fi
+
+for dependency in curl openssl base64; do
+  if ! command -v "$dependency" >/dev/null 2>&1; then
+    echo "t3code-update: $dependency not found" >&2
+    exit 1
+  fi
+done
+
+releases="${T3CODE_RELEASES:-https://github.com/pingdotgg/t3code/releases}"
+opt="${T3CODE_OPT:-$HOME/.local/opt}"
+link="${T3CODE_LINK:-$HOME/.local/bin/t3code}"
+
+# A short connect timeout: st3 runs this before every launch, and being offline
+# should cost a moment, not the launch.
+manifest="$(curl -fsSL --connect-timeout 5 --max-time 20 "$releases/latest/download/latest-linux.yml")" || {
+  echo "t3code-update: could not fetch the latest release manifest" >&2
+  exit 1
+}
+# The top-level path/sha512 keys describe the AppImage; the .deb is only listed
+# under files:, indented.
+field() { sed -n "s/^$1: *//p" <<<"$manifest" | tr -d "'\"" | head -1; }
+version="$(field version)"
+asset="$(field path)"
+sha512="$(field sha512)"
+case "$asset" in
+  *x86_64.AppImage) ;;
+  *) echo "t3code-update: the manifest does not name an x86_64 AppImage (got '$asset')" >&2; exit 1 ;;
+esac
+if [ -z "$version" ] || [ -z "$sha512" ]; then
+  echo "t3code-update: the manifest is missing a version or checksum" >&2
+  exit 1
+fi
+
+# Removes every installation but the current one. One a T3 process is still
+# running from is kept, and goes on a later run (st3 runs this before each launch).
+prune() {
+  local old
+  for old in "$opt"/t3code-*; do
+    [ "$old" != "$target" ] && [ -d "$old" ] || continue
+    if pgrep -f -- "$old/" >/dev/null 2>&1; then
+      echo "t3code-update: keeping $old, which is still running" >&2
+      continue
+    fi
+    rm -rf -- "$old"
+    echo "t3code-update: removed $old" >&2
+  done
+}
+
+target="$opt/t3code-$version"
+current="$(readlink -f -- "$link" 2>/dev/null || true)"
+if [ "$current" = "$target/squashfs-root/AppRun" ] && [ -x "$current" ]; then
+  if [ -n "$check" ]; then
+    echo "t3code-update: $version is installed and current"
+  else
+    prune
+  fi
+  exit 0
+fi
+if [ -n "$check" ]; then
+  echo "t3code-update: $version is available (installed: ${current:-none})"
+  exit 0
+fi
+
+echo "t3code-update: installing T3 Code $version" >&2
+mkdir -p "$opt" "${link%/*}"
+# Staged next to the destination so the final move is a rename, never a copy
+# that a failure could leave half-done.
+stage="$(mktemp -d "$opt/.t3code-update.XXXXXX")"
+trap 'rm -rf -- "$stage"' EXIT
+
+curl -fL --connect-timeout 10 --progress-bar -o "$stage/$asset" "$releases/download/v$version/$asset"
+actual="$(openssl dgst -sha512 -binary "$stage/$asset" | base64 -w0)"
+if [ "$actual" != "$sha512" ]; then
+  echo "t3code-update: checksum mismatch for $asset; nothing was installed" >&2
+  exit 1
+fi
+
+chmod +x "$stage/$asset"
+(cd "$stage" && "./$asset" --appimage-extract >/dev/null)
+if [ ! -x "$stage/squashfs-root/AppRun" ] || [ ! -x "$stage/squashfs-root/t3code" ]; then
+  echo "t3code-update: the extracted AppImage has no AppRun/t3code" >&2
+  exit 1
+fi
+rm -f -- "$stage/$asset"
+
+rm -rf -- "$target"
+mv -- "$stage" "$target"
+trap - EXIT
+ln -sfn -- "$target/squashfs-root/AppRun" "$link.new"
+mv -T -- "$link.new" "$link"
+echo "t3code-update: $link -> $target/squashfs-root/AppRun" >&2
+prune
